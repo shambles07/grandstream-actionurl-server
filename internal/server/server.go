@@ -23,6 +23,9 @@ import (
 // Config configures a Server.
 type Config struct {
 	Addr string
+	// Listener, if non-nil, is used instead of listening on Addr (for
+	// example a socket inherited from systemd).
+	Listener net.Listener
 	// IngestToken, if set, must be present as token=<value> on every
 	// Action URL request.
 	IngestToken string
@@ -79,11 +82,15 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
-// Serve listens on cfg.Addr until ctx is cancelled.
+// Serve listens on cfg.Listener, or cfg.Addr if that is nil, until ctx is
+// cancelled.
 func (s *Server) Serve(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.cfg.Addr)
-	if err != nil {
-		return err
+	ln := s.cfg.Listener
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", s.cfg.Addr); err != nil {
+			return err
+		}
 	}
 	if s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)

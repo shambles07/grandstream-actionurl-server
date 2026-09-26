@@ -1,0 +1,57 @@
+[Unit]
+Description=Grandstream Action URL receiver
+Documentation=https://github.com/shambles07/grandstream-actionurl-server
+After=network-online.target
+Wants=network-online.target
+
+# Works with or without gsactiond.socket:
+#  - socket enabled: systemd owns port 8086 and passes it in; -addr is ignored.
+#  - socket not enabled: gsactiond binds GSACTION_ADDR (default :8086) itself.
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/gsactiond/gsactiond.env
+ExecStart=/usr/local/bin/gsactiond -db /var/lib/gsactiond/gsactiond.db
+# For HTTPS, uncomment these and add the flags to ExecStart:
+#   -tls-cert ${CREDENTIALS_DIRECTORY}/tls.crt -tls-key ${CREDENTIALS_DIRECTORY}/tls.key
+# LoadCredential copies the files in readable by the service user, so the
+# key itself can stay root-only (0600) in /etc/gsactiond.
+#LoadCredential=tls.crt:/etc/gsactiond/tls.crt
+#LoadCredential=tls.key:/etc/gsactiond/tls.key
+Restart=on-failure
+RestartSec=2s
+
+# Runs as a transient unprivileged user; the database lives in
+# /var/lib/gsactiond (actually /var/lib/private/gsactiond, symlinked).
+DynamicUser=yes
+StateDirectory=gsactiond
+StateDirectoryMode=0750
+UMask=0077
+
+# Sandboxing: the service only needs its state directory and the network.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Refuse other syscalls with an error instead of killing the process.
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

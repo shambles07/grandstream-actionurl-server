@@ -15,19 +15,41 @@ Everything is written in Go with no C dependencies, so each tool builds as a sin
 ```sh
 make build          # static binaries in bin/ (see Building)
 
-# 1. Run the backend
+# 1. Run the backend (or install it as a service: see "Running under systemd")
 export GSACTION_TOKEN=$(openssl rand -hex 16)
-./bin/gsactiond -addr :8080 -db /var/lib/gsactiond/events.db -token "$GSACTION_TOKEN"
+./bin/gsactiond -addr :8086 -db /var/lib/gsactiond/events.db -token "$GSACTION_TOKEN"
 
 # 2a. Program phones over SSH (P-codes, verified, committed)
 export GSPROV_PASSWORD='phone-admin-password'
-./bin/gsprov ssh -server http://10.0.0.5:8080 -token "$GSACTION_TOKEN" \
+./bin/gsprov ssh -server http://10.0.0.5:8086 -token "$GSACTION_TOKEN" \
     -hosts 10.0.0.20,10.0.0.21            # or -hosts-file phones.txt
 
 # 2b. ...or generate provisioning files for your provisioning server
-./bin/gsprov xml -server http://10.0.0.5:8080 -token "$GSACTION_TOKEN" \
+./bin/gsprov xml -server http://10.0.0.5:8086 -token "$GSACTION_TOKEN" \
     -format alias -macs macs.txt -dir /srv/tftp
 ```
+
+In these examples `10.0.0.5` is the PBX host running `gsactiond`, and `10.0.0.20`/`10.0.0.21` are phones.
+
+### What `-server` means
+
+`-server` is the address of your running `gsactiond`, **written the way the phones will reach it**. `gsprov` never connects to it. It only copies that address into the start of every Action URL it programs onto the phones:
+
+```
+-server http://10.0.0.5:8086
+        └────────┬─────────┘
+http://10.0.0.5:8086/actionurl/incoming_call?mac=$mac&...
+```
+
+When the phone later has an incoming call, it requests that URL, so the phone is what connects to `-server`. Some things follow from that:
+
+- **Use an address the phones can reach**, not the one you use from your workstation. If `gsactiond` is on the PBX, use the PBX's IP or hostname on the phone VLAN. `localhost` or `127.0.0.1` would make each phone send events to itself.
+- **Include the scheme and port**: `http://host:8086`, or `https://host:8086` if `gsactiond` runs with TLS. The port must match the `gsactiond` listen port (8086 by default, or `ListenStream=` in the systemd socket).
+- **A hostname works** only if the phones can resolve it through their own DNS.
+- **If the address changes, reprovision.** The phones keep whatever URL was programmed. Re-run `gsprov` with the new `-server`, or put a stable DNS name in it from the start.
+- **The `-token` value must match** the `gsactiond` token (`GSACTION_TOKEN`). It is added to each URL in the same way.
+
+`-server` can also be set with the `GSPROV_SERVER` environment variable. Run `gsprov urls -server ...` to print the exact URLs before you program any phones.
 
 ## Events
 
@@ -63,7 +85,7 @@ The table covers all 20 events in the ActionURL guide. P-codes come from the Act
 Each generated URL passes all 15 variables as query parameters. The phone fills in the values before it sends the request:
 
 ```
-http://10.0.0.5:8080/actionurl/incoming_call?phone_ip=$phone_ip&mac=$mac&product=$product
+http://10.0.0.5:8086/actionurl/incoming_call?phone_ip=$phone_ip&mac=$mac&product=$product
   &program_version=$program_version&hardware_version=$hardware_version&language=$language
   &local=$local&display_local=$display_local&remote=$remote&display_remote=$display_remote
   &call-id=$call-id&active_user=$active_user&active_host=$active_host&duration=$duration
@@ -114,13 +136,64 @@ Each flag can also be set with the environment variable shown.
 
 | Flag | Env | Default | |
 |---|---|---|---|
-| `-addr` | `GSACTION_ADDR` | `:8080` | listen address |
+| `-addr` | `GSACTION_ADDR` | `:8086` | listen address (ignored when started by `gsactiond.socket`) |
 | `-db` | `GSACTION_DB` | `gsactiond.db` | SQLite path |
 | `-token` | `GSACTION_TOKEN` | | phones must send `token=` (recommended) |
 | `-api-token` | `GSACTION_API_TOKEN` | | bearer token for `/api` |
 | `-tls-cert`, `-tls-key` | `GSACTION_TLS_CERT/KEY` | | serve HTTPS (TLS 1.2 minimum, for older phones) |
 | `-retention` | `GSACTION_RETENTION` | `90d` | `0` keeps data forever |
 | `-log-level` | `GSACTION_LOG_LEVEL` | `info` | `debug` logs every event |
+
+## Running under systemd
+
+`deploy/systemd/` contains:
+
+| File | Installed to | Purpose |
+|---|---|---|
+| `gsactiond.socket` | `/etc/systemd/system/` | systemd listens on TCP **8086** and starts `gsactiond` on the first phone request |
+| `gsactiond.service` | `/etc/systemd/system/` | runs `/usr/local/bin/gsactiond` as a sandboxed, unprivileged user |
+| `gsactiond.env` | `/etc/gsactiond/` (mode 0600) | tokens, retention and log level |
+
+```sh
+make build                      # as your user
+sudo make install               # binaries, units, and an env file (an existing one is never overwritten)
+sudoedit /etc/gsactiond/gsactiond.env     # set GSACTION_TOKEN (openssl rand -hex 16)
+sudo systemctl daemon-reload
+sudo systemctl enable --now gsactiond.socket
+# optional: also start the service at boot instead of on the first request
+sudo systemctl enable gsactiond.service
+```
+
+Useful commands:
+
+- Check status: `systemctl status gsactiond.socket gsactiond.service`
+- Follow the logs: `journalctl -u gsactiond -f`
+- Quick check (starts the service if it isn't already running): `curl http://localhost:8086/healthz`
+
+**Socket or no socket.** The service works either way.
+
+- **With `gsactiond.socket` enabled,** systemd owns the port and hands it to `gsactiond`, which ignores `-addr`/`GSACTION_ADDR`. The port stays open across restarts and upgrades (`systemctl restart gsactiond`), so phones don't get "connection refused" while the service is down; their requests wait in the socket backlog.
+- **Without the socket,** `gsactiond` binds `GSACTION_ADDR` (default `:8086`) itself. `gsactiond` reads the socket using the standard `LISTEN_FDS` protocol, with no libsystemd dependency, so the binary stays static.
+
+**Changing the port or address.** Run `sudo systemctl edit gsactiond.socket` and add:
+
+```ini
+[Socket]
+ListenStream=
+ListenStream=10.0.0.5:8086
+```
+
+The empty `ListenStream=` line clears the default before the new one is added. After changing the port, reprovision the phones with a matching `-server`.
+
+**Database location.** The database is at `/var/lib/gsactiond/gsactiond.db`. `DynamicUser=` runs the service as a transient user, and `StateDirectory=` gives that user ownership of this directory; on disk it is `/var/lib/private/gsactiond`, and `/var/lib/gsactiond` is a symlink to it. Back it up with `sqlite3 /var/lib/gsactiond/gsactiond.db ".backup /root/gsactiond.bak"`; this is safe while the service is running.
+
+**HTTPS.** Uncomment the `LoadCredential=` lines in the service (via `systemctl edit gsactiond.service`), add the `-tls-cert`/`-tls-key` flags shown there to `ExecStart`, and use `https://` in `gsprov -server`.
+
+**Firewall.** Allow TCP 8086 from the phone subnets only, for example:
+
+```sh
+sudo ufw allow from 10.0.0.0/24 to any port 8086 proto tcp
+```
 
 ## Provisioning
 
@@ -160,7 +233,7 @@ Other behavior:
 ### expect script
 
 ```sh
-gsprov cli -server http://10.0.0.5:8080 -token "$GSACTION_TOKEN" > actionurl.cmds
+gsprov cli -server http://10.0.0.5:8086 -token "$GSACTION_TOKEN" > actionurl.cmds
 GSPROV_PASSWORD=… ./scripts/push-actionurl.exp 10.0.0.20 admin actionurl.cmds
 ```
 

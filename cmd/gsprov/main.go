@@ -75,7 +75,7 @@ type common struct {
 }
 
 func (c *common) register(fs *flag.FlagSet) {
-	fs.StringVar(&c.server, "server", os.Getenv("GSPROV_SERVER"), "gsactiond base URL as the phone reaches it, e.g. http://10.0.0.5:8080")
+	fs.StringVar(&c.server, "server", os.Getenv("GSPROV_SERVER"), "gsactiond base URL as the phone reaches it, e.g. http://10.0.0.5:8086")
 	fs.StringVar(&c.token, "token", os.Getenv("GSACTION_TOKEN"), "shared token (must match gsactiond -token)")
 	fs.StringVar(&c.format, "format", "pcode", "config key style: pcode (P8310) or alias (ons.actionUrl.incomingCall)")
 	fs.StringVar(&c.vars, "vars", "", "comma-separated dynamic variables to include (default: all 15)")

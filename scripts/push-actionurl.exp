@@ -6,7 +6,7 @@
 # same thing natively, in parallel, with read-back verification). Generate the
 # command file with gsprov, then run this script once per phone:
 #
-#   gsprov cli -server http://10.0.0.5:8080 -token "$TOKEN" > actionurl.cmds
+#   gsprov cli -server http://10.0.0.5:8086 -token "$TOKEN" > actionurl.cmds
 #   GSPROV_PASSWORD='admin-password' ./scripts/push-actionurl.exp 10.0.0.20 admin actionurl.cmds
 #
 # The password is read from the environment so it does not appear in the

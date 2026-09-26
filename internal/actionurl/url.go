@@ -13,7 +13,7 @@ const IngestPathPrefix = "/actionurl/"
 // URLOptions controls how Action URL templates are built.
 type URLOptions struct {
 	// Server is the base URL of the backend as reachable from the phone,
-	// e.g. "http://10.0.0.5:8080". A missing scheme is left missing, since
+	// e.g. "http://10.0.0.5:8086". A missing scheme is left missing, since
 	// some older firmware expects the bare "host[:port]/path" form.
 	Server string
 	// Token, when set, is appended as token=<Token> so the backend can reject

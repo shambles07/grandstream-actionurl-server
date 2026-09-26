@@ -1,0 +1,14 @@
+[Unit]
+Description=Grandstream Action URL receiver socket
+Documentation=https://github.com/shambles07/grandstream-actionurl-server
+
+[Socket]
+# Phones send Action URL requests here. Listens on all IPv4 and IPv6
+# addresses; use e.g. ListenStream=10.0.0.5:8086 to bind a single address.
+ListenStream=8086
+NoDelay=true
+# Hand the socket to gsactiond.service (the default, stated for clarity).
+Service=gsactiond.service
+
+[Install]
+WantedBy=sockets.target

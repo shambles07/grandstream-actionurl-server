@@ -25,7 +25,7 @@ func main() {
 
 func run() error {
 	var (
-		addr      = flag.String("addr", envOr("GSACTION_ADDR", ":8080"), "listen address")
+		addr      = flag.String("addr", envOr("GSACTION_ADDR", ":8086"), "listen address (ignored when started by a systemd .socket unit)")
 		dbPath    = flag.String("db", envOr("GSACTION_DB", "gsactiond.db"), "SQLite database path")
 		token     = flag.String("token", os.Getenv("GSACTION_TOKEN"), "shared token phones must send as token=... (recommended)")
 		apiToken  = flag.String("api-token", os.Getenv("GSACTION_API_TOKEN"), "bearer token required on /api requests")
@@ -68,8 +68,17 @@ func run() error {
 		go pruneLoop(ctx, st, keep, log)
 	}
 
+	ln, err := server.SystemdListener()
+	if err != nil {
+		return err
+	}
+	if ln != nil {
+		log.Info("using socket from systemd", "addr", ln.Addr().String())
+	}
+
 	srv := server.New(server.Config{
 		Addr:        *addr,
+		Listener:    ln,
 		IngestToken: *token,
 		APIToken:    *apiToken,
 		TLSCert:     *tlsCert,

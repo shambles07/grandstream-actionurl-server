@@ -45,7 +45,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	delete(params, "token")
 
 	e := eventFromParams(ev.Slug, params)
-	e.ReceivedAt = time.Now()
+	// Millisecond precision matches what the database stores.
+	e.ReceivedAt = time.Now().UTC().Truncate(time.Millisecond)
 	e.RawQuery = redactToken(raw)
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		e.SourceIP = host

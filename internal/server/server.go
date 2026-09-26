@@ -282,6 +282,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.WriteHeader(code)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	enc.SetEscapeHTML(false) // keep & in URLs and raw queries readable
 	enc.Encode(v)
 }
 

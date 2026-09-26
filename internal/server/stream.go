@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -96,8 +97,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			if (mac != "" && e.MAC != mac) || (event != "" && e.Event != event) {
 				continue
 			}
-			b, _ := json.Marshal(e)
-			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Event, b)
+			var b bytes.Buffer
+			enc := json.NewEncoder(&b)
+			enc.SetEscapeHTML(false)
+			enc.Encode(e) // appends '\n', which ends the data: line
+			fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n", e.ID, e.Event, b.Bytes())
 		}
 		flusher.Flush()
 	}

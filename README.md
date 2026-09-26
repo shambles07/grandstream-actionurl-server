@@ -6,7 +6,7 @@ Everything is written in Go with no C dependencies, so each tool builds as a sin
 
 | Binary | Purpose |
 |---|---|
-| `gsactiond` | HTTP server. Phones send events to it, it writes them to SQLite, and it serves a read-only JSON API plus a live SSE stream for a future web UI. |
+| `gsactiond` | HTTP server. Phones send events to it, it writes them to SQLite, and it serves a read-only JSON API plus a live Server-Sent Events stream. |
 | `gsprov` | Provisioning CLI. Builds Action URLs and writes them to phones as XML (P-code or v2 alias format), CLI command lists, or a live SSH session with read-back checks. |
 | `scripts/push-actionurl.exp` | A classic `expect` alternative to `gsprov ssh`, for one phone at a time. |
 
@@ -70,15 +70,13 @@ The table covers all 20 events in the ActionURL guide. P-codes come from the Act
 | `forward_off` | Call Forwarding Off | Close Forward | P8319 | `ons.actionUrl.closedForward` |
 | `hold_call` | Hold Call | Hold Call | P8324 | `ons.actionUrl.holdCall` |
 | `resume_call` | Resume Call | UnHold Call | P8325 | `ons.actionUrl.unholdCall` |
-| `syslog_on` | Syslog On | Open Syslog | P8330 | `ons.actionUrl.openSyslog` ⚠ |
-| `syslog_off` | Syslog Off | Close Syslog | P8331 | `ons.actionUrl.closedSyslog` ⚠ |
+| `syslog_on` | Syslog On | Open Syslog | P8330 | `ons.actionUrl.openSyslog` |
+| `syslog_off` | Syslog Off | Close Syslog | P8331 | `ons.actionUrl.closedSyslog` |
 | `boot_completed` | Booting Completed | Setup Completed | P8304 | `ons.actionUrl.setupCompleted` |
 | `blind_transfer` | Blind Transferring | Blind Transfer | P8320 | `ons.actionUrl.blindTransfer` |
 | `attended_transfer` | Attended Transferring | Attended Transfer | P8321 | `ons.actionUrl.attendedTransfer` |
 | `registered` | Registration | Registered | P8305 | `ons.actionUrl.registered` |
 | `unregistered` | Sign Off | Unregistered | P8306 | `ons.actionUrl.unregistered` |
-
-⚠ I couldn't find the two syslog aliases in any published template, so I guessed them from the pattern of the other aliases. `gsprov` prints a warning when it emits them. Check them against your model's config template, or use `-format pcode`, which is verified for every event.
 
 ## Dynamic variables
 
@@ -96,7 +94,7 @@ Use `-vars mac,call-id,remote,...` to send fewer variables. This matters if a fi
 
 ## How the server handles phone requests
 
-- **Two URL styles.** It accepts the generated `/actionurl/<event>?k=v&...` form and the guide's `server/<path>/k=v&...` form.
+- **Two URL styles.** It accepts the generated `/actionurl/<event>?k=v&...` form and the `server/<path>/k=v&...` form shown in Grandstream's ActionURL guide.
 - **Raw spaces.** Phones can put display names such as `John Doe` into the request line without encoding them, and Go's `net/http` would reject that with a 400. A small listener wrapper percent-encodes those bytes before parsing, including on keep-alive connections.
 - **`+` signs.** A leading `+` in an E.164 number is kept as `+`, not turned into a space.
 - **Unfilled variables.** If an event has no value for a variable, the phone sends the literal placeholder (for example `remote=$remote`). These are stored as empty.
@@ -115,20 +113,175 @@ The database is SQLite in WAL mode, using the pure-Go `modernc.org/sqlite` drive
 
 ## JSON API
 
-If `-api-token` is set, every endpoint requires `Authorization: Bearer <token>`.
+The API is read-only and is served on the same port as the phone endpoint.
+
+**Authentication.** The API token is optional:
+
+- **With `-api-token` (`GSACTION_API_TOKEN`) set,** every `/api` request must send `Authorization: Bearer <token>`. Anything else gets `401`.
+- **Without it,** the API is open to anyone who can reach the port. That is fine on a loopback-only or firewalled host. Otherwise set a token, because the API exposes phone IPs, extensions and call history.
+
+The phone token (`-token`) is separate: it protects only `/actionurl/`, and the API never accepts it. `/healthz` never requires a token.
 
 | Endpoint | Returns |
 |---|---|
 | `GET /api/v1/catalog` | Events (with P-codes and aliases) and variables |
 | `GET /api/v1/phones` | All phones, most recently seen first |
 | `GET /api/v1/phones/{mac}` | One phone |
-| `GET /api/v1/phones/{mac}/events` | That phone's events |
-| `GET /api/v1/phones/{mac}/calls` | That phone's calls |
-| `GET /api/v1/events?mac=&event=&call_id=&since=&until=&limit=&before_id=` | Events, newest first. Paginate with `next_before_id`. `since` and `until` take RFC 3339 times or durations like `24h` / `7d`. |
+| `GET /api/v1/phones/{mac}/events` | That phone's events (same filters as `/events`) |
+| `GET /api/v1/phones/{mac}/calls` | That phone's calls (same filters as `/calls`) |
+| `GET /api/v1/events?mac=&event=&call_id=&since=&until=&limit=&before_id=` | Events, newest first. `limit` defaults to 100 (max 1000). Paginate with `next_before_id`. `since` and `until` take RFC 3339 times or durations like `24h` / `7d`. |
 | `GET /api/v1/events/stats?since=7d` | Count of events per type |
 | `GET /api/v1/events/stream?mac=&event=` | Server-Sent Events stream of new events as they arrive |
-| `GET /api/v1/calls?mac=&call_id=&state=open\|ringing\|active\|held\|ended\|missed` | Calls |
-| `GET /healthz` | Liveness check |
+| `GET /api/v1/calls?mac=&call_id=&state=&limit=` | Calls, most recently updated first. `state` is `open` (not yet ended) or one of `ringing`, `dialing`, `active`, `held`, `ended`, `missed`. |
+| `GET /healthz` | Liveness check (no auth) |
+
+MACs are accepted in any format (`00:0B:82:AA:BB:CC`, `00-0b-82-aa-bb-cc`, `000b82aabbcc`) and always returned as 12 lowercase hex digits.
+
+### Querying with curl
+
+The examples assume the following variables. If no API token is set, leave out `-H "$AUTH"`.
+
+```sh
+API=http://10.0.0.5:8086/api/v1
+AUTH="Authorization: Bearer $GSACTION_API_TOKEN"
+```
+
+Quote URLs that contain `?` or `&` so the shell doesn't interpret them.
+
+**All phones:**
+
+```sh
+curl -s -H "$AUTH" "$API/phones"
+```
+
+**One phone:**
+
+```sh
+curl -s -H "$AUTH" "$API/phones/00:0B:82:AA:BB:CC"
+```
+
+```json
+{
+  "mac": "000b82aabbcc",
+  "phone_ip": "10.0.0.20",
+  "product": "GXP2170",
+  "program_version": "1.0.11.79",
+  "active_user": "1001",
+  "active_host": "pbx.example.com",
+  "source_ip": "10.0.0.20",
+  "registered": true,
+  "dnd": true,
+  "first_seen_at": "2026-09-26T18:05:16.187Z",
+  "last_seen_at": "2026-09-26T18:05:16.212Z",
+  "last_event": "dnd_on",
+  "event_count": 4
+}
+```
+
+State flags (`registered`, `dnd`, `forwarding`, `syslog`, `off_hook`) are left out until the phone has sent an event that sets them.
+
+**Calls in progress:**
+
+```sh
+curl -s -H "$AUTH" "$API/calls?state=open"
+```
+
+```json
+{
+  "calls": [
+    {
+      "id": 1,
+      "mac": "000b82aabbcc",
+      "call_id": "8f2c1e@10.0.0.20",
+      "direction": "incoming",
+      "local": "1001",
+      "remote": "+15551234567",
+      "display_remote": "John Doe",
+      "active_user": "1001",
+      "active_host": "pbx.example.com",
+      "state": "active",
+      "started_at": "2026-09-26T18:05:16.195Z",
+      "answered_at": "2026-09-26T18:05:16.204Z",
+      "updated_at": "2026-09-26T18:05:16.204Z"
+    }
+  ]
+}
+```
+
+**Recent calls on one phone:**
+
+```sh
+curl -s -H "$AUTH" "$API/phones/000b82aabbcc/calls?limit=10"
+```
+
+**Every event for one call:**
+
+```sh
+curl -s -H "$AUTH" "$API/events?call_id=8f2c1e@10.0.0.20"
+```
+
+**Missed calls in the last 24 hours:**
+
+```sh
+curl -s -H "$AUTH" "$API/events?event=missed_call&since=24h"
+```
+
+**Events in a time window:**
+
+```sh
+curl -s -H "$AUTH" "$API/events?since=2026-09-01T00:00:00Z&until=2026-09-02T00:00:00Z"
+```
+
+**Paging through events.** Each response includes `next_before_id`. Pass it back as `before_id` to get the next (older) page:
+
+```sh
+curl -s -H "$AUTH" "$API/events?limit=500"
+curl -s -H "$AUTH" "$API/events?limit=500&before_id=12345"
+```
+
+**Event counts per type for the last week:**
+
+```sh
+curl -s -H "$AUTH" "$API/events/stats?since=7d"
+```
+
+**Supported events and variables:**
+
+```sh
+curl -s -H "$AUTH" "$API/catalog"
+```
+
+**Watch events live.** `-N` turns off curl's output buffering. Filter with `mac=` and/or `event=`:
+
+```sh
+curl -sN -H "$AUTH" "$API/events/stream?event=incoming_call"
+```
+
+```
+: connected
+
+id: 5
+event: incoming_call
+data: {"id":5,"received_at":"2026-09-26T18:05:17.276Z","event":"incoming_call","mac":"000b82aabbcc","remote":"2000","call_id":"x9",...}
+```
+
+Lines starting with `:` are comments, and a `: keepalive` line is sent every 25 seconds.
+
+**Combining with `jq`:**
+
+```sh
+# phones with DND on
+curl -s -H "$AUTH" "$API/phones" | jq -r '.phones[] | select(.dnd) | .mac'
+
+# phones not heard from in the last day (GNU date)
+curl -s -H "$AUTH" "$API/phones" |
+  jq -r --arg t "$(date -u -d '1 day ago' +%FT%TZ)" '.phones[] | select(.last_seen_at < $t) | "\(.mac) \(.phone_ip) \(.last_seen_at)"'
+
+# firmware versions in use
+curl -s -H "$AUTH" "$API/phones" | jq -r '.phones[] | "\(.product) \(.program_version)"' | sort | uniq -c
+```
+
+**Errors** return a non-2xx status with `{"error": "..."}`. Use `curl -f` to make curl exit non-zero on them, which is useful in scripts.
 
 ## gsactiond flags
 

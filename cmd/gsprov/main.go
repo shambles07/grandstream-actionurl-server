@@ -1,0 +1,411 @@
+// Command gsprov programs Grandstream phones with Action URLs that point at
+// gsactiond, either by generating XML provisioning files or by driving each
+// phone's SSH CLI.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"text/tabwriter"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+
+	"github.com/shambles07/grandstream-actionurl-server/internal/actionurl"
+	"github.com/shambles07/grandstream-actionurl-server/internal/provision"
+)
+
+const usage = `gsprov - program Grandstream Action URLs
+
+Usage:
+  gsprov events                      list supported events, P-codes and aliases
+  gsprov urls  -server URL [flags]   print the Action URL for each event
+  gsprov xml   -server URL [flags]   write an XML provisioning file
+  gsprov cli   -server URL [flags]   print SSH CLI "set" commands (for scripts/push-actionurl.exp)
+  gsprov ssh   -server URL -hosts ... [flags]
+                                     push settings to phones over SSH
+
+Run "gsprov <command> -h" for flags.
+`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprint(os.Stderr, usage)
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	var err error
+	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
+	case "events":
+		err = cmdEvents()
+	case "urls":
+		err = cmdURLs(args)
+	case "xml":
+		err = cmdXML(args)
+	case "cli":
+		err = cmdCLI(args)
+	case "ssh":
+		err = cmdSSH(ctx, args)
+	case "-h", "--help", "help":
+		fmt.Print(usage)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gsprov:", err)
+		os.Exit(1)
+	}
+}
+
+// common holds the flags shared by every command that builds settings.
+type common struct {
+	server, token, format, vars, events string
+}
+
+func (c *common) register(fs *flag.FlagSet) {
+	fs.StringVar(&c.server, "server", os.Getenv("GSPROV_SERVER"), "gsactiond base URL as the phone reaches it, e.g. http://10.0.0.5:8080")
+	fs.StringVar(&c.token, "token", os.Getenv("GSACTION_TOKEN"), "shared token (must match gsactiond -token)")
+	fs.StringVar(&c.format, "format", "pcode", "config key style: pcode (P8310) or alias (ons.actionUrl.incomingCall)")
+	fs.StringVar(&c.vars, "vars", "", "comma-separated dynamic variables to include (default: all 15)")
+	fs.StringVar(&c.events, "events", "", "comma-separated event slugs to configure (default: all 20)")
+}
+
+func (c *common) settings() (actionurl.Format, []actionurl.Setting, error) {
+	f, err := actionurl.ParseFormat(c.format)
+	if err != nil {
+		return "", nil, err
+	}
+	evs, err := actionurl.SelectEvents(splitList(c.events))
+	if err != nil {
+		return "", nil, err
+	}
+	s, err := actionurl.BuildSettings(f, actionurl.URLOptions{
+		Server: c.server, Token: c.token, Params: splitList(c.vars),
+	}, evs)
+	if err != nil {
+		return "", nil, err
+	}
+	if f == actionurl.FormatAlias {
+		for _, e := range evs {
+			if !e.AliasVerified {
+				fmt.Fprintf(os.Stderr, "warning: alias %s (%s) is not in a published Grandstream template; confirm it against your model's template\n", e.Alias, e.Name)
+			}
+		}
+	}
+	return f, s, nil
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func cmdEvents() error {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "SLUG\tEVENT\tWEB UI LABEL\tP-CODE\tV2 ALIAS")
+	for _, e := range actionurl.Events {
+		alias := e.Alias
+		if !e.AliasVerified {
+			alias += " (unverified)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Slug, e.Name, e.WebUIName, e.PCode, alias)
+	}
+	fmt.Fprintln(tw)
+	fmt.Fprintln(tw, "VARIABLE\tPARAM\tDESCRIPTION")
+	for _, v := range actionurl.Variables {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", v.Token, v.Param, v.Description)
+	}
+	return tw.Flush()
+}
+
+func cmdURLs(args []string) error {
+	fs := flag.NewFlagSet("urls", flag.ExitOnError)
+	var c common
+	c.register(fs)
+	fs.Parse(args)
+	f, settings, err := c.settings()
+	if err != nil {
+		return err
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	for _, s := range settings {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Event.Name, s.Event.Key(f), s.Value)
+	}
+	return tw.Flush()
+}
+
+func cmdXML(args []string) error {
+	fs := flag.NewFlagSet("xml", flag.ExitOnError)
+	var c common
+	c.register(fs)
+	mac := fs.String("mac", "", "phone MAC; embeds <mac> and names the file cfg<mac>.xml")
+	macsFile := fs.String("macs", "", "file with one MAC per line; writes one cfg<mac>.xml per phone into -dir")
+	dir := fs.String("dir", ".", "output directory for -mac / -macs")
+	out := fs.String("o", "", "output file (default: stdout, or cfg<mac>.xml in -dir with -mac)")
+	fs.Parse(args)
+
+	f, settings, err := c.settings()
+	if err != nil {
+		return err
+	}
+
+	var macs []string
+	if *mac != "" {
+		macs = append(macs, *mac)
+	}
+	if *macsFile != "" {
+		lines, err := readLines(*macsFile)
+		if err != nil {
+			return err
+		}
+		macs = append(macs, lines...)
+	}
+
+	if len(macs) == 0 {
+		if *out == "" {
+			return provision.WriteXML(os.Stdout, f, "", settings)
+		}
+		return writeXMLFile(*out, f, "", settings)
+	}
+	if *out != "" && len(macs) > 1 {
+		return errors.New("-o cannot be used with more than one MAC; use -dir")
+	}
+	for _, m := range macs {
+		m = normalizeMAC(m)
+		if len(m) != 12 {
+			return fmt.Errorf("invalid MAC %q", m)
+		}
+		path := *out
+		if path == "" {
+			path = filepath.Join(*dir, provision.ConfigFileName(m))
+		}
+		if err := writeXMLFile(path, f, m, settings); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "wrote", path)
+	}
+	return nil
+}
+
+func writeXMLFile(path string, f actionurl.Format, mac string, settings []actionurl.Setting) error {
+	fh, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := provision.WriteXML(fh, f, mac, settings); err != nil {
+		fh.Close()
+		return err
+	}
+	return fh.Close()
+}
+
+func cmdCLI(args []string) error {
+	fs := flag.NewFlagSet("cli", flag.ExitOnError)
+	var c common
+	c.register(fs)
+	prefix := fs.Bool("pcode-prefix", false, `send "set P8310 ..." instead of "set 8310 ..."`)
+	fs.Parse(args)
+	f, settings, err := c.settings()
+	if err != nil {
+		return err
+	}
+	for _, cmd := range provision.CLICommands(settings, f, *prefix) {
+		fmt.Printf("set %s %s\n", cmd.Key, cmd.Setting.Value)
+	}
+	return nil
+}
+
+func cmdSSH(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("ssh", flag.ExitOnError)
+	var c common
+	c.register(fs)
+	home, _ := os.UserHomeDir()
+	var (
+		hosts       = fs.String("hosts", "", "comma-separated phone addresses (host or host:port)")
+		hostsFile   = fs.String("hosts-file", "", "file with one phone address per line")
+		user        = fs.String("user", "admin", "SSH user")
+		password    = fs.String("password", "", "SSH password (prefer GSPROV_PASSWORD env var)")
+		keyFile     = fs.String("key", "", "SSH private key file (for phones with an uploaded public key)")
+		knownHosts  = fs.String("known-hosts", filepath.Join(home, ".config", "gsprov", "known_hosts"), "known_hosts file for phone host keys")
+		acceptNew   = fs.Bool("accept-new", true, "add host keys of phones not yet in -known-hosts (a changed key is always rejected)")
+		insecure    = fs.Bool("insecure-ignore-host-key", false, "do not verify host keys (lab use only)")
+		legacy      = fs.Bool("legacy-algorithms", false, "allow SHA-1 key exchange/ciphers required by old firmware")
+		timeout     = fs.Duration("timeout", 15*time.Second, "timeout for connecting and for each CLI step")
+		verify      = fs.Bool("verify", true, "read back each value with \"get\" and compare")
+		commit      = fs.Bool("commit", true, "commit changes to flash (false = trial run lost on reboot)")
+		reboot      = fs.Bool("reboot", false, "reboot the phone after committing")
+		dryRun      = fs.Bool("dry-run", false, "print the CLI session instead of connecting")
+		concurrency = fs.Int("concurrency", 8, "phones to program in parallel")
+		prefix      = fs.Bool("pcode-prefix", false, `send "set P8310 ..." instead of "set 8310 ..."`)
+		transcripts = fs.String("transcript-dir", "", "write each phone's raw CLI output to <dir>/<host>.log")
+		jsonOut     = fs.Bool("json", false, "print results as JSON lines")
+	)
+	fs.Parse(args)
+
+	f, settings, err := c.settings()
+	if err != nil {
+		return err
+	}
+	cmds := provision.CLICommands(settings, f, *prefix)
+
+	targets := splitList(*hosts)
+	if *hostsFile != "" {
+		lines, err := readLines(*hostsFile)
+		if err != nil {
+			return err
+		}
+		targets = append(targets, lines...)
+	}
+	if len(targets) == 0 {
+		return errors.New("no phones given; use -hosts or -hosts-file")
+	}
+
+	if *dryRun {
+		for _, t := range targets {
+			fmt.Printf("# %s (ssh %s@%s)\nconfig\n", t, *user, t)
+			for _, cmd := range cmds {
+				fmt.Printf("set %s %s\n", cmd.Key, cmd.Setting.Value)
+				if *verify {
+					fmt.Printf("get %s\n", cmd.Key)
+				}
+			}
+			if *commit {
+				fmt.Println("commit")
+			}
+			fmt.Println("exit")
+			if *commit && *reboot {
+				fmt.Println("reboot")
+			}
+		}
+		return nil
+	}
+
+	if *password == "" {
+		*password = os.Getenv("GSPROV_PASSWORD")
+	}
+	var signers []ssh.Signer
+	if *keyFile != "" {
+		pem, err := os.ReadFile(*keyFile)
+		if err != nil {
+			return err
+		}
+		s, err := ssh.ParsePrivateKey(pem)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", *keyFile, err)
+		}
+		signers = append(signers, s)
+	}
+	if *password == "" && len(signers) == 0 {
+		return errors.New("no credentials: set GSPROV_PASSWORD, -password or -key")
+	}
+	hkcb, err := provision.HostKeyPolicy(*knownHosts, *acceptNew, *insecure)
+	if err != nil {
+		return err
+	}
+	if *transcripts != "" {
+		if err := os.MkdirAll(*transcripts, 0o700); err != nil {
+			return err
+		}
+	}
+
+	type result struct {
+		Host    string                `json:"host"`
+		OK      bool                  `json:"ok"`
+		Error   string                `json:"error,omitempty"`
+		Results []provision.SetResult `json:"results,omitempty"`
+	}
+	var (
+		mu       sync.Mutex
+		failures int
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, max(1, *concurrency))
+	)
+	report := func(r result) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !r.OK {
+			failures++
+		}
+		if *jsonOut {
+			b, _ := json.Marshal(r)
+			fmt.Println(string(b))
+			return
+		}
+		if r.OK {
+			fmt.Printf("ok    %s  (%d settings)\n", r.Host, len(r.Results))
+		} else {
+			fmt.Printf("FAIL  %s  %s (%d settings applied before failure)\n", r.Host, r.Error, len(r.Results))
+		}
+	}
+
+	for _, t := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(host string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			o := provision.SSHOptions{
+				User: *user, Password: *password, Signers: signers,
+				HostKeyCallback: hkcb, Legacy: *legacy, Timeout: *timeout,
+				Verify: *verify, Commit: *commit, Reboot: *reboot,
+			}
+			if *transcripts != "" {
+				name := strings.NewReplacer(":", "_", "/", "_").Replace(host) + ".log"
+				if fh, err := os.Create(filepath.Join(*transcripts, name)); err == nil {
+					defer fh.Close()
+					o.Transcript = fh
+				}
+			}
+			res, err := provision.PushSSH(ctx, host, cmds, o)
+			r := result{Host: host, OK: err == nil, Results: res}
+			if err != nil {
+				r.Error = err.Error()
+			}
+			report(r)
+		}(t)
+	}
+	wg.Wait()
+	if failures > 0 {
+		return fmt.Errorf("%d of %d phones failed", failures, len(targets))
+	}
+	return nil
+}
+
+func readLines(path string) ([]string, error) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	var out []string
+	sc := bufio.NewScanner(fh)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, strings.Fields(line)[0])
+	}
+	return out, sc.Err()
+}
+
+func normalizeMAC(s string) string {
+	return strings.ToLower(strings.NewReplacer(":", "", "-", "", ".", "").Replace(strings.TrimSpace(s)))
+}

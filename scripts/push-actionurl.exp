@@ -1,0 +1,90 @@
+#!/usr/bin/expect -f
+#
+# Push Action URL settings to one Grandstream phone over its SSH CLI.
+#
+# This is the dependency-light alternative to "gsprov ssh" (which does the
+# same thing natively, in parallel, with read-back verification). Generate the
+# command file with gsprov, then run this script once per phone:
+#
+#   gsprov cli -server http://10.0.0.5:8080 -token "$TOKEN" > actionurl.cmds
+#   GSPROV_PASSWORD='admin-password' ./scripts/push-actionurl.exp 10.0.0.20 admin actionurl.cmds
+#
+# The password is read from the environment so it does not appear in the
+# process list. Set GSPROV_REBOOT=1 to reboot the phone after committing.
+
+set timeout 15
+log_user 1
+
+if {[llength $argv] != 3} {
+    puts stderr "usage: push-actionurl.exp <host> <user> <commands-file>"
+    exit 2
+}
+lassign $argv host user cmdfile
+
+if {![info exists env(GSPROV_PASSWORD)]} {
+    puts stderr "GSPROV_PASSWORD is not set"
+    exit 2
+}
+set password $env(GSPROV_PASSWORD)
+
+set port 22
+if {[regexp {^(.+):([0-9]+)$} $host -> h p]} {
+    set host $h
+    set port $p
+}
+
+spawn ssh -p $port -o StrictHostKeyChecking=accept-new $user@$host
+
+# Log in and wait for the top-level prompt (e.g. "GS> " or "GXP2170> ").
+expect {
+    -nocase -re {password:\s*$}  { send -- "$password\r"; exp_continue }
+    -nocase -re {user ?name:\s*$} { send -- "$user\r"; exp_continue }
+    -nocase -re {permission denied} { puts stderr "\nlogin failed"; exit 1 }
+    -re {> ?$} {}
+    timeout { puts stderr "\ntimed out waiting for prompt"; exit 1 }
+    eof     { puts stderr "\nconnection closed"; exit 1 }
+}
+
+send -- "config\r"
+expect {
+    -nocase -re {config> ?$} {}
+    timeout { puts stderr "\ncould not enter config mode"; exit 1 }
+}
+
+set fh [open $cmdfile r]
+while {[gets $fh line] >= 0} {
+    set line [string trim $line]
+    if {$line eq "" || [string index $line 0] eq "#"} { continue }
+    send -- "$line\r"
+    expect {
+        -nocase -re {\m(error|invalid|unknown command|failed)\M} {
+            puts stderr "\nphone rejected: $line"
+            exit 1
+        }
+        -nocase -re {config> ?$} {}
+        timeout { puts stderr "\ntimed out after: $line"; exit 1 }
+    }
+}
+close $fh
+
+send -- "commit\r"
+expect {
+    -nocase -re {commit[^\n]*\n.*config> ?$} {}
+    timeout { puts stderr "\ncommit not confirmed"; exit 1 }
+}
+
+send -- "exit\r"
+expect -re {> ?$}
+
+if {[info exists env(GSPROV_REBOOT)] && $env(GSPROV_REBOOT) eq "1"} {
+    send -- "reboot\r"
+    expect {
+        -nocase -re {\((y/n|yes/no)\)} { send -- "y\r" }
+        timeout {}
+        eof {}
+    }
+} else {
+    send -- "exit\r"
+    expect eof
+}
+puts "\ndone: $host"

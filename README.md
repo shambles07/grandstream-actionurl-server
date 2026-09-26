@@ -2,7 +2,7 @@
 
 A backend that receives Grandstream **Action URL** events from phones and stores them in SQLite. It also includes a provisioning tool that programs those Action URLs onto phones, either as XML config files or live over the phone's SSH CLI.
 
-Everything is written in Go with no cgo, so each tool builds as a single static binary.
+Everything is written in Go with no C dependencies, so each tool builds as a single static binary that does not depend on the system's glibc (see [Building](#building)).
 
 | Binary | Purpose |
 |---|---|
@@ -13,7 +13,7 @@ Everything is written in Go with no cgo, so each tool builds as a single static 
 ## Quick start
 
 ```sh
-go build -o bin/ ./cmd/...
+make build          # static binaries in bin/ (see Building)
 
 # 1. Run the backend
 export GSACTION_TOKEN=$(openssl rand -hex 16)
@@ -164,10 +164,28 @@ gsprov cli -server http://10.0.0.5:8080 -token "$GSACTION_TOKEN" > actionurl.cmd
 GSPROV_PASSWORD=… ./scripts/push-actionurl.exp 10.0.0.20 admin actionurl.cmds
 ```
 
+## Building
+
+`make build` produces fully static binaries with no glibc (or any libc) dependency, so a binary built on one distro runs on any Linux of the same CPU architecture, including Alpine/musl and old enterprise releases.
+
+The code itself needs no C: the SQLite driver (`modernc.org/sqlite`) is SQLite translated to Go. The only thing that would pull in glibc is Go's standard `net` package, which by default uses the C library's DNS resolver when cgo is available. The Makefile sets `CGO_ENABLED=0`, so Go uses its built-in resolver instead and links everything statically. If you build by hand, set it yourself:
+
+```sh
+CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o bin/ ./cmd/...
+file bin/gsactiond    # ... statically linked
+```
+
+A plain `go build` without `CGO_ENABLED=0` still works but links against the build machine's glibc (2.34+ on a current distro), and the result fails with `GLIBC_x.yy not found` on older systems.
+
+The pure-Go resolver reads `/etc/resolv.conf` and `/etc/hosts` directly. It does not consult NSS modules (`/etc/nsswitch.conf` entries such as LDAP or mDNS); normal DNS names and IP addresses are unaffected.
+
+`make dist` cross-compiles static binaries for `linux/amd64`, `linux/arm64`, `linux/arm` (v7) and `linux/386` into `dist/<version>/`. Override the list with `PLATFORMS="linux/amd64 windows/amd64 darwin/arm64"`. No cross toolchain is needed.
+
 ## Development
 
 ```sh
-go test -race ./...
+make test            # or: go test ./...
+go test -race ./...  # the race detector needs cgo, so run it with CGO_ENABLED unset
 ```
 
 The tests cover the full ingest path over real TCP, including raw spaces in the request line and keep-alive connections. They also run the call-state logic, check that both XML formats are well-formed, and run SSH provisioning against a simulated Grandstream CLI. That includes a case where the phone truncates a value: the tool must detect it and refuse to commit.

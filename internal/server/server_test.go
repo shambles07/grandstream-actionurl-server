@@ -156,6 +156,10 @@ func TestPathStyleAndAuth(t *testing.T) {
 	if code := rawGet(t, base, "/actionurl/nope?token=tok"); code != 404 {
 		t.Errorf("unknown event: status %d, want 404", code)
 	}
+	// WP820-only event (entered in the web UI, no P-code).
+	if code := rawGet(t, base, "/actionurl/panic_call?mac=000b82000001&token=tok"); code != 200 {
+		t.Errorf("panic_call: status %d", code)
+	}
 	// Guide style: variables in the path after the event.
 	if code := rawGet(t, base, "/actionurl/missed_call/mac=000b82000001&remote=2000&call-id=x1&token=tok"); code != 200 {
 		t.Fatalf("path style: status %d", code)

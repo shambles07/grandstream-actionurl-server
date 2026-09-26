@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,8 +28,9 @@ import (
 const usage = `gsprov - program Grandstream Action URLs
 
 Usage:
-  gsprov events                      list supported events, P-codes and aliases
-  gsprov urls  -server URL [flags]   print the Action URL for each event
+  gsprov events                      list supported events, P-codes, aliases and models
+  gsprov print -server URL [flags]   print the value of every Action URL field, to copy
+                                     into the web UI (use -model wp820 for WP8xx phones)
   gsprov xml   -server URL [flags]   write an XML provisioning file
   gsprov cli   -server URL [flags]   print SSH CLI "set" commands (for scripts/push-actionurl.exp)
   gsprov ssh   -server URL -hosts ... [flags]
@@ -49,8 +51,8 @@ func main() {
 	switch cmd, args := os.Args[1], os.Args[2:]; cmd {
 	case "events":
 		err = cmdEvents()
-	case "urls":
-		err = cmdURLs(args)
+	case "print", "urls":
+		err = cmdPrint(args)
 	case "xml":
 		err = cmdXML(args)
 	case "cli":
@@ -118,37 +120,124 @@ func splitList(s string) []string {
 }
 
 func cmdEvents() error {
+	dash := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		return s
+	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "SLUG\tEVENT\tWEB UI LABEL\tP-CODE\tV2 ALIAS")
 	for _, e := range actionurl.Events {
 		alias := e.Alias
-		if !e.AliasVerified {
+		if alias != "" && !e.AliasVerified {
 			alias += " (unverified)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Slug, e.Name, e.WebUIName, e.PCode, alias)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", e.Slug, e.Name, e.WebUIName, dash(e.PCode), dash(alias))
 	}
 	fmt.Fprintln(tw)
 	fmt.Fprintln(tw, "VARIABLE\tPARAM\tDESCRIPTION")
 	for _, v := range actionurl.Variables {
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", v.Token, v.Param, v.Description)
 	}
+	fmt.Fprintln(tw)
+	fmt.Fprintln(tw, "MODEL\tPHONES\tWEB UI LOCATION\tXML/SSH")
+	for _, m := range actionurl.Models {
+		prov := "yes"
+		if !m.Provisionable {
+			prov = "no (web UI only)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", m.Name, m.Title, m.WebUIPath, prov)
+	}
 	return tw.Flush()
 }
 
-func cmdURLs(args []string) error {
-	fs := flag.NewFlagSet("urls", flag.ExitOnError)
+// printField is one row of "gsprov print" output.
+type printField struct {
+	Event string `json:"event"`
+	Label string `json:"label"`
+	PCode string `json:"pcode,omitempty"`
+	Alias string `json:"alias,omitempty"`
+	URL   string `json:"url"`
+}
+
+func cmdPrint(args []string) error {
+	fs := flag.NewFlagSet("print", flag.ExitOnError)
 	var c common
 	c.register(fs)
+	model := fs.String("model", "gxp", "phone family, for web UI labels and order: gxp or wp820 (see gsprov events)")
+	kv := fs.Bool("kv", false, "print KEY=VALUE lines using -format keys (models with config keys only)")
+	jsonOut := fs.Bool("json", false, "print a JSON array")
 	fs.Parse(args)
-	f, settings, err := c.settings()
+
+	m, err := actionurl.LookupModel(*model)
 	if err != nil {
 		return err
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	for _, s := range settings {
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Event.Name, s.Event.Key(f), s.Value)
+	f, err := actionurl.ParseFormat(c.format)
+	if err != nil {
+		return err
 	}
-	return tw.Flush()
+	sel, err := m.Select(splitList(c.events))
+	if err != nil {
+		return err
+	}
+	opts := actionurl.URLOptions{Server: c.server, Token: c.token, Params: splitList(c.vars)}
+	rows := make([]printField, 0, len(sel))
+	for _, fld := range sel {
+		u, err := actionurl.BuildURL(fld.Event, opts)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, printField{
+			Event: fld.Event.Slug, Label: fld.Label,
+			PCode: fld.Event.PCode, Alias: fld.Event.Alias, URL: u,
+		})
+	}
+	return writePrint(os.Stdout, m, f, rows, *kv, *jsonOut)
+}
+
+func writePrint(w io.Writer, m actionurl.Model, f actionurl.Format, rows []printField, kv, jsonOut bool) error {
+	switch {
+	case jsonOut:
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		enc.SetEscapeHTML(false)
+		return enc.Encode(rows)
+
+	case kv:
+		if !m.Provisionable {
+			return fmt.Errorf("model %s stores these URLs outside P-values, so there are no config keys; drop -kv", m.Name)
+		}
+		for _, r := range rows {
+			key := r.PCode
+			if f == actionurl.FormatAlias {
+				key = r.Alias
+			}
+			fmt.Fprintf(w, "%s=%s\n", key, r.URL)
+		}
+		return nil
+	}
+
+	// Default: one block per web UI field, with the URL alone on its line
+	// so it can be selected and pasted as-is.
+	fmt.Fprintf(w, "# %s\n# Web UI: %s\n", m.Title, m.WebUIPath)
+	if !m.Provisionable {
+		fmt.Fprintln(w, "# These fields are not stored in P-values: enter them in the web UI.")
+	}
+	if len(m.Unsupported) > 0 {
+		fmt.Fprintf(w, "# Not available on this model: %s\n", strings.Join(m.Unsupported, ", "))
+	}
+	for _, r := range rows {
+		fmt.Fprintln(w)
+		if m.Provisionable {
+			fmt.Fprintf(w, "%s  [%s / %s]\n", r.Label, r.PCode, r.Alias)
+		} else {
+			fmt.Fprintln(w, r.Label)
+		}
+		fmt.Fprintln(w, r.URL)
+	}
+	return nil
 }
 
 func cmdXML(args []string) error {

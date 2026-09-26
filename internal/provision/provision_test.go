@@ -50,8 +50,9 @@ func TestWriteXML(t *testing.T) {
 				texts = append(texts, string(cd))
 			}
 		}
-		if len(texts) != len(actionurl.Events) {
-			t.Fatalf("%s: %d values, want %d", f, len(texts), len(actionurl.Events))
+		provisionable, _ := actionurl.SelectEvents(nil)
+		if len(texts) != len(provisionable) {
+			t.Fatalf("%s: %d values, want %d", f, len(texts), len(provisionable))
 		}
 		if !strings.Contains(texts[0], "&call-id=$call-id&") {
 			t.Errorf("%s: value not round-tripped: %s", f, texts[0])
@@ -179,7 +180,7 @@ func TestPushSSH(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res) != len(actionurl.Events) || !res[0].Verified {
+	if len(res) != len(cmds) || len(cmds) != 20 || !res[0].Verified {
 		t.Fatalf("results = %+v", res)
 	}
 	phone.mu.Lock()

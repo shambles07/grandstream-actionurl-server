@@ -10,7 +10,10 @@
 //   - GXP21xx firmware 1.0.11.x config template (v2 alias names)
 package actionurl
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Event is one phone event that can be bound to an Action URL.
 type Event struct {
@@ -33,10 +36,16 @@ type Event struct {
 
 // PCodeNumber returns the P-code without its leading "P" (the SSH CLI's
 // "set" command takes the bare number).
-func (e Event) PCodeNumber() string { return e.PCode[1:] }
+func (e Event) PCodeNumber() string { return strings.TrimPrefix(e.PCode, "P") }
 
-// Events lists every event supported by the ActionURL module, in the order
-// the user guide lists them.
+// Provisionable reports whether the event has a config key, i.e. whether it
+// can be set by XML provisioning or the SSH CLI. Events without one can only
+// be entered in the phone's web UI.
+func (e Event) Provisionable() bool { return e.PCode != "" }
+
+// Events lists every event the backend accepts: first the 20 events of the
+// ActionURL module, in the order the user guide lists them, then events that
+// only some models offer.
 var Events = []Event{
 	{"incoming_call", "Incoming Call", "Incoming Call", "P8310", "ons.actionUrl.incomingCall", true},
 	{"outgoing_call", "Outgoing Call", "Outgoing Call", "P8311", "ons.actionUrl.outgoingCall", true},
@@ -58,6 +67,12 @@ var Events = []Event{
 	{"attended_transfer", "Attended Transferring", "Attended Transfer", "P8321", "ons.actionUrl.attendedTransfer", true},
 	{"registered", "Registration", "Registered", "P8305", "ons.actionUrl.registered", true},
 	{"unregistered", "Sign Off", "Unregistered", "P8306", "ons.actionUrl.unregistered", true},
+
+	// WP8xx-only events. The WP820 keeps its Event Notification URLs outside
+	// the P-value store, so these have no config keys.
+	{"log_on", "Log On", "Log On", "", "", false},
+	{"log_off", "Log Off", "Log Off", "", "", false},
+	{"panic_call", "SAFE/Panic Call", "SAFE/Panic Call", "", "", false},
 }
 
 var eventsBySlug = func() map[string]Event {

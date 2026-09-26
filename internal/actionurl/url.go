@@ -67,13 +67,17 @@ type Setting struct {
 	Value string
 }
 
-// BuildSettings returns one Setting per event, in catalog order.
+// BuildSettings returns one Setting per event, in catalog order. Empty
+// events means every provisionable event.
 func BuildSettings(f Format, o URLOptions, events []Event) ([]Setting, error) {
 	if len(events) == 0 {
-		events = Events
+		events, _ = SelectEvents(nil)
 	}
 	out := make([]Setting, 0, len(events))
 	for _, e := range events {
+		if !e.Provisionable() {
+			return nil, fmt.Errorf("event %q has no config key; it can only be entered in the web UI (see gsprov print)", e.Slug)
+		}
 		u, err := BuildURL(e, o)
 		if err != nil {
 			return nil, err
@@ -83,10 +87,17 @@ func BuildSettings(f Format, o URLOptions, events []Event) ([]Setting, error) {
 	return out, nil
 }
 
-// SelectEvents resolves a list of slugs to events. Empty means all events.
+// SelectEvents resolves a list of slugs to events. Empty means every
+// provisionable event (those with a P-code).
 func SelectEvents(slugs []string) ([]Event, error) {
 	if len(slugs) == 0 {
-		return Events, nil
+		var out []Event
+		for _, e := range Events {
+			if e.Provisionable() {
+				out = append(out, e)
+			}
+		}
+		return out, nil
 	}
 	out := make([]Event, 0, len(slugs))
 	for _, s := range slugs {

@@ -7,7 +7,7 @@ Everything is written in Go with no C dependencies, so each tool builds as a sin
 | Binary | Purpose |
 |---|---|
 | `gsactiond` | HTTP server. Phones send events to it, it writes them to SQLite, and it serves a read-only JSON API plus a live Server-Sent Events stream. |
-| `gsprov` | Provisioning CLI. Builds Action URLs and writes them to phones as XML (P-code or v2 alias format), CLI command lists, or a live SSH session with read-back checks. |
+| `gsprov` | Provisioning CLI. Builds Action URLs and writes them to phones as XML (P-code or v2 alias format), CLI command lists, or a live SSH session with read-back checks. It can also print every field's value to copy into the phone's web UI. |
 | `scripts/push-actionurl.exp` | A classic `expect` alternative to `gsprov ssh`, for one phone at a time. |
 
 ## Quick start
@@ -49,11 +49,11 @@ When the phone later has an incoming call, it requests that URL, so the phone is
 - **If the address changes, reprovision.** The phones keep whatever URL was programmed. Re-run `gsprov` with the new `-server`, or put a stable DNS name in it from the start.
 - **The `-token` value must match** the `gsactiond` token (`GSACTION_TOKEN`). It is added to each URL in the same way.
 
-`-server` can also be set with the `GSPROV_SERVER` environment variable. Run `gsprov urls -server ...` to print the exact URLs before you program any phones.
+`-server` can also be set with the `GSPROV_SERVER` environment variable. Run `gsprov print -server ...` to see the exact URLs before you program any phones.
 
 ## Events
 
-The table covers all 20 events in the ActionURL guide. P-codes come from the Action URL P-value tables in the GXP16xx, GXP21xx and GRP261x admin guides. Aliases come from the GXP21xx 1.0.11.x config template. Run `gsprov events` to print this table.
+The first 20 rows are the events in Grandstream's ActionURL guide. P-codes come from the Action URL P-value tables in the GXP16xx, GXP21xx and GRP261x admin guides. Aliases come from the GXP21xx 1.0.11.x config template. The last three rows are events that only the WP8xx phones offer; they have no config keys (see [WP820](#wp820-and-other-web-ui-only-phones)). Run `gsprov events` to print this table.
 
 | Slug | Guide name | Web UI label | P-code | v2 alias |
 |---|---|---|---|---|
@@ -77,6 +77,9 @@ The table covers all 20 events in the ActionURL guide. P-codes come from the Act
 | `attended_transfer` | Attended Transferring | Attended Transfer | P8321 | `ons.actionUrl.attendedTransfer` |
 | `registered` | Registration | Registered | P8305 | `ons.actionUrl.registered` |
 | `unregistered` | Sign Off | Unregistered | P8306 | `ons.actionUrl.unregistered` |
+| `log_on` | – | Log On (WP8xx) | – | – |
+| `log_off` | – | Log Off (WP8xx) | – | – |
+| `panic_call` | – | SAFE/Panic Call (WP8xx) | – | – |
 
 ## Dynamic variables
 
@@ -349,6 +352,75 @@ sudo ufw allow from 10.0.0.0/24 to any port 8086 proto tcp
 ```
 
 ## Provisioning
+
+| Method | Command | Phones |
+|---|---|---|
+| Print values to copy into the web UI | `gsprov print` | any, and the only option for WP8xx |
+| XML provisioning file | `gsprov xml` | GXP16xx / GXP21xx / GRP26xx |
+| Live over SSH | `gsprov ssh`, or `scripts/push-actionurl.exp` | GXP16xx / GXP21xx / GRP26xx |
+
+### Printing values (`gsprov print`)
+
+`gsprov print` shows the value for each Action URL field, using the phone's web UI labels and order. Nothing is sent to any phone. Each URL is on a line of its own so you can select and paste it:
+
+```sh
+gsprov print -server http://10.0.0.5:8086 -token "$GSACTION_TOKEN"
+```
+
+```
+# GXP16xx / GXP21xx / GRP26xx
+# Web UI: Settings > Outbound Notification > Action URL
+# Not available on this model: log_on, log_off, panic_call
+
+Setup Completed  [P8304 / ons.actionUrl.setupCompleted]
+http://10.0.0.5:8086/actionurl/boot_completed?phone_ip=$phone_ip&mac=$mac&...&token=...
+
+Registered  [P8305 / ons.actionUrl.registered]
+http://10.0.0.5:8086/actionurl/registered?phone_ip=$phone_ip&mac=$mac&...&token=...
+...
+```
+
+Options:
+
+| Flag | Effect |
+|---|---|
+| `-model gxp\|wp820` | Which phone family's labels, order and fields to show (default `gxp`). |
+| `-events a,b,...` | Only these events, still in web UI order. |
+| `-vars a,b,...` | Fewer dynamic variables per URL, for shorter values. |
+| `-kv` | `KEY=VALUE` lines, keyed by P-code, or by alias with `-format alias`. Only for models with config keys. |
+| `-json` | A JSON array of `{event, label, pcode, alias, url}`. |
+
+`gsprov urls` still works as another name for `gsprov print`.
+
+### WP820 and other web-UI-only phones
+
+The WP820 (and the rest of the WP8xx family) handles Action URLs differently from the desk phones:
+
+- **No config keys.** Grandstream's WP820 config template marks the Event Notification section "Not stored in pvalue". These URLs have no P-codes or aliases, so `gsprov xml` and `gsprov ssh` can't set them. They have to be entered by hand in the web UI.
+- **Different location.** The fields are under **Maintenance > Event Notification**, not Settings > Outbound Notification as on the GXP phones.
+- **Different events.** The WP820 has no Off Hook, On Hook or Syslog events. It adds Log On, Log Off and SAFE/Panic Call, which `gsactiond` records as `log_on`, `log_off` and `panic_call`.
+
+Print the values with the WP820 labels and order:
+
+```sh
+gsprov print -model wp820 -server http://10.0.0.5:8086 -token "$GSACTION_TOKEN"
+```
+
+```
+# WP820 / WP8xx
+# Web UI: Maintenance > Event Notification
+# These fields are not stored in P-values: enter them in the web UI.
+# Not available on this model: off_hook, on_hook, syslog_on, syslog_off
+
+Bootup Completed
+http://10.0.0.5:8086/actionurl/boot_completed?phone_ip=$phone_ip&mac=$mac&...&token=...
+
+Incoming Call
+http://10.0.0.5:8086/actionurl/incoming_call?phone_ip=$phone_ip&mac=$mac&...&token=...
+...
+```
+
+Paste each URL into the field with the same label, then save. Every phone gets the same values, because the phone fills in `$mac`, `$phone_ip` and the other variables itself.
 
 ### XML
 
